@@ -115,8 +115,10 @@ DEFECT_SEVERITY = {
 source steel_venv/bin/activate
 
 # Run the application
+python -c "from ultralytics import YOLO; model = YOLO('yolov8n.pt'); print('Model downloaded successfully')"
 ./run_app.sh
 # or
+python -c "from ultralytics import YOLO; model = YOLO('yolov8n.pt'); print('Model downloaded successfully')"
 streamlit run app.py
 ```
 
