@@ -87,5 +87,6 @@ streamlit
 streamlit-option-menu
 types-PyYAML
 types-setuptools
+ultralytics
 wheel 
 zarr
