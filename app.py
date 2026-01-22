@@ -6,6 +6,13 @@ from io import StringIO, BytesIO
 import hashlib
 from PIL import Image
 import base64
+import json
+from datetime import datetime
+try:
+    import openai
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
 
 # Comprehensive NNPACK warning suppression
 os.environ['NNPACK_DISABLE'] = '1'
@@ -28,6 +35,10 @@ warnings.filterwarnings("ignore")
 
 import streamlit as st
 import cv2
+
+# Show OpenAI warning if not available
+if not HAS_OPENAI:
+    st.warning("⚠️ OpenAI not installed. Install with: pip install openai")
 
 # Import torch with stderr suppression
 with suppress_stderr():
@@ -71,13 +82,25 @@ st.markdown("Real-time defect detection demo using **AMD Instinct + ROCm**")
 # Sidebar Controls
 # -----------------------
 st.sidebar.header("⚙️ Inference Controls")
-video_path = st.sidebar.text_input("Video path", "sample_video-4.mp4")
+video_path = st.sidebar.text_input("Video path", "sample_video-3.mp4")
 confidence = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.4)
 precision = st.sidebar.selectbox("Precision Mode", ["INT8 (Fastest)", "FP16 (GPU)", "FP32"])
 start_button = st.sidebar.button("▶ Start")
 stop_button = st.sidebar.button("⏹ Stop")
 fps_target = st.sidebar.slider("Max FPS", 1, 60, 20)
 buffer_size = st.sidebar.slider("Frame Buffer", 1, 10, 3)
+
+# LLM Configuration
+st.sidebar.header("🤖 AI Assistant")
+enable_llm = st.sidebar.checkbox("Enable AI Analysis", value=True if HAS_OPENAI else False, disabled=not HAS_OPENAI)
+if enable_llm and HAS_OPENAI:
+    openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password", help="Required for AI analysis and recommendations")
+    llm_model = st.sidebar.selectbox("LLM Model", ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"], index=0)
+    analysis_frequency = st.sidebar.slider("Analysis Frequency (seconds)", 5, 60, 10)
+else:
+    openai_api_key = None
+    llm_model = None
+    analysis_frequency = 10
 
 # -----------------------
 # Session State & Threading
@@ -100,6 +123,18 @@ if "frame_hash" not in st.session_state:
     st.session_state.frame_hash = None
 if "current_frame_b64" not in st.session_state:
     st.session_state.current_frame_b64 = None
+if "current_defects" not in st.session_state:
+    st.session_state.current_defects = 0
+if "current_defect_counts" not in st.session_state:
+    st.session_state.current_defect_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+if "llm_analysis" not in st.session_state:
+    st.session_state.llm_analysis = ""
+if "last_llm_update" not in st.session_state:
+    st.session_state.last_llm_update = 0
+if "defect_history" not in st.session_state:
+    st.session_state.defect_history = []
+if "maintenance_recommendations" not in st.session_state:
+    st.session_state.maintenance_recommendations = []
 
 # -----------------------
 # Device & AMD Instinct 300X Setup
@@ -117,8 +152,8 @@ if device == "cuda":
             st.sidebar.success(f"🚀 AMD GPU Detected: {gpu_name}")
             # AMD-specific optimizations
             torch.cuda.empty_cache()
-            # Disable problematic optimizations for AMD
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+            # Updated environment variable for newer PyTorch
+            os.environ['PYTORCH_ALLOC_CONF'] = 'max_split_size_mb:128'
         else:
             st.sidebar.info(f"🖥️ GPU: {gpu_name}")
             
@@ -131,6 +166,10 @@ if device == "cuda":
 @st.cache_resource
 def load_model():
     # Suppress YOLO warnings and NNPACK
+    if not os.path.exists("yolov8n.pt"):
+        st.error("❌ Model file 'yolov8n.pt' not found!")
+        st.stop()
+    
     with suppress_stderr():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -141,6 +180,117 @@ def load_model():
 @st.cache_resource
 def load_quantized_model(_precision):
     """Load model with specific quantization for AMD GPUs"""
+    with suppress_stderr():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+def analyze_defects_with_llm(defect_data, defect_counts, api_key, model="gpt-4o-mini"):
+    """Generate intelligent analysis of detected defects using LLM"""
+    if not api_key or not HAS_OPENAI:
+        return "LLM analysis unavailable - API key required"
+    
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        
+        # Prepare defect summary
+        total_defects = sum(defect_counts.values())
+        severity_breakdown = ", ".join([f"{k}: {v}" for k, v in defect_counts.items() if v > 0])
+        
+        recent_defects = ", ".join([d['type'] for d in defect_data[-10:]])  # Last 10 defects
+        
+        prompt = f"""
+As a steel manufacturing quality control expert, analyze this defect detection data:
+
+Current Frame Analysis:
+- Total defects detected: {total_defects}
+- Severity breakdown: {severity_breakdown}
+- Recent defect types: {recent_defects}
+
+Provide:
+1. Brief assessment of current quality status
+2. Immediate action recommendations if critical/high severity defects present
+3. Potential root causes for observed defect patterns
+4. Preventive maintenance suggestions
+
+Keep response concise and actionable for production floor operators.
+"""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are an expert steel manufacturing quality control analyst with 20+ years experience in defect analysis and process optimization."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            temperature=0.3
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"LLM Analysis Error: {str(e)}"
+
+def generate_defect_report(defect_history, api_key, model="gpt-4o-mini"):
+    """Generate comprehensive defect analysis report"""
+    if not api_key or not HAS_OPENAI or not defect_history:
+        return "Report generation unavailable"
+    
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        
+        # Analyze recent defect trends
+        recent_defects = defect_history[-50:]  # Last 50 defects
+        defect_types = {}
+        severity_trends = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        
+        for defect in recent_defects:
+            defect_type = defect.get('type', 'Unknown')
+            severity = defect.get('severity', 'LOW')
+            defect_types[defect_type] = defect_types.get(defect_type, 0) + 1
+            severity_trends[severity] += 1
+        
+        top_defects = sorted(defect_types.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        prompt = f"""
+Generate a steel manufacturing quality control report based on recent defect data:
+
+Defect Statistics (Last 50 detections):
+- Most common defects: {top_defects}
+- Severity distribution: {dict(severity_trends)}
+- Total defects analyzed: {len(recent_defects)}
+
+Provide a structured report with:
+1. **Quality Status Summary**
+2. **Key Defect Patterns**
+3. **Risk Assessment**
+4. **Recommended Actions**
+5. **Process Optimization Suggestions**
+
+Format for production management review.
+"""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a senior quality control manager generating executive reports for steel manufacturing operations."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.2
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"Report Generation Error: {str(e)}"
+
+@st.cache_resource
+def load_quantized_model(_precision):
+    """Load model with specific quantization for AMD GPUs"""
+    if not os.path.exists("yolov8n.pt"):
+        st.error("❌ Model file 'yolov8n.pt' not found!")
+        st.stop()
+        
     with suppress_stderr():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -161,7 +311,8 @@ def load_quantized_model(_precision):
     
     return model
 
-model = load_model()
+# Model will be loaded lazily when needed
+# model = load_model()  # Commented out to prevent startup blocking
 
 # -----------------------
 # Steel Defect Detection Configuration
@@ -240,7 +391,7 @@ DEFECT_SEVERITY = {
     'Crack': 'HIGH',
     'Foreign Object': 'HIGH',
     'Deep Defect': 'MEDIUM',
-    'Corrosion': 'MEDIUM',
+    'Corrosion': 'HIGH',
     'Edge Defect': 'MEDIUM',
     'Scale Formation': 'MEDIUM',
     'Surface Defect': 'LOW',
@@ -428,8 +579,9 @@ def process_video_worker(cap, frame_queue, stats, running_flag, fps_target, mode
         processing_latency = (end_time - start_time) * 1000  # ms
         
         # Update defect statistics
-        defect_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-        total_defects = 0
+        current_defect_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        current_total_defects = 0
+        detected_defects = []
         
         if len(results) > 0 and len(results[0].boxes) > 0:
             boxes = results[0].boxes
@@ -438,14 +590,31 @@ def process_video_worker(cap, frame_queue, stats, running_flag, fps_target, mode
                 class_id = int(box.cls[0])
                 class_name = results[0].names[class_id]
                 defect_name, severity = get_defect_info(class_name, confidence)
-                defect_counts[severity] += 1
-                total_defects += 1
+                current_defect_counts[severity] += 1
+                current_total_defects += 1
+                
+                # Store defect for LLM analysis
+                detected_defects.append({
+                    'type': defect_name,
+                    'severity': severity,
+                    'confidence': confidence,
+                    'timestamp': time.time(),
+                    'class_name': class_name
+                })
         
-        # Update stats
+        # Update stats with current frame data
         stats["latency"] = processing_latency
         stats["frame_count"] += 1
-        stats["total_defects"] = total_defects
-        stats["defect_counts"] = defect_counts
+        stats["current_total_defects"] = current_total_defects
+        stats["current_defect_counts"] = current_defect_counts
+        
+        # Keep track of last detection for consistent display
+        if current_total_defects > 0:
+            stats["last_total_defects"] = current_total_defects
+            stats["last_defect_counts"] = current_defect_counts.copy()
+        elif "last_total_defects" not in stats:
+            stats["last_total_defects"] = 0
+            stats["last_defect_counts"] = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
         
         # Calculate FPS
         if stats["frame_count"] > 1:
@@ -457,9 +626,19 @@ def process_video_worker(cap, frame_queue, stats, running_flag, fps_target, mode
         frame_b64 = convert_cv2_to_base64(annotated, quality=85)
         frame_hash = get_image_hash(annotated)
         
-        # Put processed frame in queue
+        # Put processed frame in queue with defect info
+        frame_data = {
+            'frame_b64': frame_b64,
+            'frame_hash': frame_hash,
+            'latency': processing_latency,
+            'fps': stats["fps"],
+            'total_defects': current_total_defects,
+            'defect_counts': current_defect_counts.copy(),
+            'detected_defects': detected_defects  # Add defect data for LLM analysis
+        }
+        
         try:
-            frame_queue.put((frame_b64, frame_hash, processing_latency, stats["fps"]), timeout=0.1)
+            frame_queue.put(frame_data, timeout=0.1)
         except queue.Full:
             # If queue is full, skip this frame
             pass
@@ -483,8 +662,17 @@ if start_button:
         else:
             st.session_state.cap = cap
             
-            # Load optimized model based on precision
-            optimized_model = load_quantized_model(precision)
+            # Load optimized model based on precision with progress indicator
+            with st.spinner(f"🔄 Loading {precision} model..."):
+                try:
+                    optimized_model = load_quantized_model(precision)
+                    st.success("✅ Model loaded successfully!")
+                except Exception as e:
+                    st.error(f"❌ Failed to load model: {str(e)}")
+                    st.session_state.running = False
+                    cap.release()
+                    st.session_state.cap = None
+                    st.stop()
             
             # Set video capture properties for better performance
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -542,12 +730,29 @@ if st.session_state.running:
     try:
         # Get latest frame from queue without blocking
         frame_data = st.session_state.frame_queue.get_nowait()
-        frame_b64, frame_hash, latency, fps_val = frame_data
+        
+        # Extract frame information
+        frame_b64 = frame_data['frame_b64']
+        frame_hash = frame_data['frame_hash']
+        latency = frame_data['latency']
+        fps_val = frame_data['fps']
+        current_defects = frame_data['total_defects']
+        current_defect_counts = frame_data['defect_counts']
         
         # Only update display if frame changed (reduces Streamlit load)
         if frame_hash != st.session_state.frame_hash and frame_b64 is not None:
             st.session_state.current_frame_b64 = frame_b64
             st.session_state.frame_hash = frame_hash
+            # Update defect info in session state for consistent display
+            st.session_state.current_defects = current_defects
+            st.session_state.current_defect_counts = current_defect_counts
+            
+            # Update defect history for LLM analysis
+            if 'detected_defects' in frame_data and frame_data['detected_defects']:
+                st.session_state.defect_history.extend(frame_data['detected_defects'])
+                # Keep only last 100 defects to prevent memory issues
+                if len(st.session_state.defect_history) > 100:
+                    st.session_state.defect_history = st.session_state.defect_history[-100:]
         
         # Update metrics
         fps_box.metric("FPS", f"{fps_val:.1f}")
@@ -566,29 +771,13 @@ if st.session_state.running:
         else:
             st.sidebar.metric("Precision Mode", "🔧 FP32 Precise")
         
-        # Display defect statistics in sidebar
-        if "total_defects" in st.session_state.stats:
+# Display defect statistics in sidebar using synchronized frame data
+        if hasattr(st.session_state, 'current_defects'):
             st.sidebar.markdown("---")
             st.sidebar.markdown("**🔍 Current Frame Defects:**")
-            st.sidebar.metric("Total Defects", st.session_state.stats.get("total_defects", 0))
+            st.sidebar.metric("Total Defects", st.session_state.current_defects)
             
-            defect_counts = st.session_state.stats.get("defect_counts", {})
-            if defect_counts.get('CRITICAL', 0) > 0:
-                st.sidebar.error(f"🚨 Critical: {defect_counts['CRITICAL']}")
-            if defect_counts.get('HIGH', 0) > 0:
-                st.sidebar.warning(f"⚠️ High: {defect_counts['HIGH']}")
-            if defect_counts.get('MEDIUM', 0) > 0:
-                st.sidebar.info(f"ℹ️ Medium: {defect_counts['MEDIUM']}")
-            if defect_counts.get('LOW', 0) > 0:
-                st.sidebar.success(f"✅ Low: {defect_counts['LOW']}")
-        
-        # Display defect statistics in sidebar
-        if "total_defects" in st.session_state.stats:
-            st.sidebar.markdown("---")
-            st.sidebar.markdown("**🔍 Current Frame Defects:**")
-            st.sidebar.metric("Total Defects", st.session_state.stats.get("total_defects", 0))
-            
-            defect_counts = st.session_state.stats.get("defect_counts", {})
+            defect_counts = st.session_state.current_defect_counts
             if defect_counts.get('CRITICAL', 0) > 0:
                 st.sidebar.error(f"🚨 Critical: {defect_counts['CRITICAL']}")
             if defect_counts.get('HIGH', 0) > 0:
@@ -603,7 +792,7 @@ if st.session_state.running:
         if st.session_state.stats["frame_count"] > 0:
             fps_box.metric("FPS", f"{st.session_state.stats['fps']:.1f}")
             latency_box.metric("Latency (ms)", f"{st.session_state.stats['latency']:.1f}")
-            device_box.metric("Device", device.upper())
+            #device_box.metric("Device", device.upper())
     
     # Display current frame using HTML (avoids Streamlit file storage)
     if st.session_state.current_frame_b64 is not None:
@@ -620,6 +809,89 @@ else:
         frame_placeholder.info("📹 Click 'Start' to begin video processing")
     else:
         frame_placeholder.info("⏸️ Processing stopped")
+
+# -----------------------
+# LLM AI Analysis Panel
+# -----------------------
+if enable_llm and openai_api_key and HAS_OPENAI:
+    st.markdown("---")
+    st.subheader("🤖 AI Quality Analysis")
+    
+    col_analysis, col_report = st.columns(2)
+    
+    with col_analysis:
+        st.markdown("**Real-time Defect Analysis**")
+        analysis_placeholder = st.empty()
+        
+        # Trigger LLM analysis periodically
+        current_time = time.time()
+        if (st.session_state.current_defects > 0 and 
+            current_time - st.session_state.last_llm_update > analysis_frequency and
+            st.session_state.running):
+            
+            with st.spinner("Analyzing defects..."):
+                analysis = analyze_defects_with_llm(
+                    st.session_state.defect_history[-10:],  # Recent defects
+                    st.session_state.current_defect_counts,
+                    openai_api_key,
+                    llm_model
+                )
+                st.session_state.llm_analysis = analysis
+                st.session_state.last_llm_update = current_time
+        
+        if st.session_state.llm_analysis:
+            analysis_placeholder.markdown(f"```\n{st.session_state.llm_analysis}\n```")
+        else:
+            analysis_placeholder.info("🔄 Waiting for defect data to analyze...")
+    
+    with col_report:
+        st.markdown("**Quality Control Report**")
+        if st.button("📊 Generate Full Report", help="Generate comprehensive defect analysis report"):
+            with st.spinner("Generating comprehensive report..."):
+                report = generate_defect_report(
+                    st.session_state.defect_history,
+                    openai_api_key,
+                    llm_model
+                )
+                with st.expander("📋 Quality Control Report", expanded=True):
+                    st.markdown(report)
+        
+        # Show defect history summary
+        if st.session_state.defect_history:
+            recent_count = len([d for d in st.session_state.defect_history 
+                             if time.time() - d['timestamp'] < 300])  # Last 5 minutes
+            st.metric("Defects (5 min)", recent_count)
+            
+            # Show severity breakdown
+            severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+            for defect in st.session_state.defect_history[-20:]:  # Last 20 defects
+                severity_counts[defect['severity']] += 1
+            
+            st.markdown("**Recent Severity Breakdown:**")
+            for severity, count in severity_counts.items():
+                if count > 0:
+                    color = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'LOW': '🟢'}[severity]
+                    st.markdown(f"{color} **{severity}**: {count}")
+                    
+            # Export defect data
+            if st.button("💾 Export Defect Data"):
+                import json
+                export_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "total_defects": len(st.session_state.defect_history),
+                    "defects": st.session_state.defect_history[-50:],  # Last 50 defects
+                    "summary": severity_counts
+                }
+                st.download_button(
+                    "📥 Download JSON",
+                    json.dumps(export_data, indent=2),
+                    f"steel_defects_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    "application/json"
+                )
+elif enable_llm and not HAS_OPENAI:
+    st.warning("⚠️ OpenAI package not installed. Install with: `pip install openai`")
+elif enable_llm and not openai_api_key:
+    st.info("🔑 Enter OpenAI API key in sidebar to enable AI analysis")
 
 # -----------------------
 # Performance Information
@@ -651,7 +923,7 @@ with st.expander("📊 Performance Guide (AMD Instinct 300X)", expanded=False):
             st.write(f"**ROCm Optimizations:** ✅ Enabled")
             st.write(f"**NNPACK:** ❌ Disabled (AMD compatibility)")
         except:
-            st.write("**GPU:** CUDA Device")
+            st.write("**GPU:** AMD Instinct Detected")
     else:
         st.write("**Device:** CPU")
 
