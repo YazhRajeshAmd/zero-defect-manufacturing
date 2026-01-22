@@ -12,8 +12,8 @@ export OMP_NUM_THREADS=1
 export HSA_ENABLE_SDMA=0
 export CUDA_VISIBLE_DEVICES=0
 
-# PyTorch optimizations for AMD
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+# PyTorch optimizations for AMD (updated variable name)
+export PYTORCH_ALLOC_CONF="max_split_size_mb:128"
 
 # Suppress other common warnings
 export PYTHONWARNINGS="ignore"
