@@ -48,7 +48,33 @@ The system maps YOLO's 80 object classes to steel manufacturing defects:
 - Surface Defect, Surface Scratch
 - Small Inclusion, Small Pit
 
-## 🛠️ Technical Architecture
+## � Quick Start
+
+### Method 1: Using Launch Script (Recommended)
+```bash
+# Activate virtual environment
+source steelvenv/bin/activate
+
+# Launch with optimized settings
+./run_app.sh
+```
+
+### Method 2: Direct Streamlit Command
+```bash
+# Activate virtual environment
+source steelvenv/bin/activate
+
+# Run with Streamlit
+streamlit run app.py
+```
+
+### ⚠️ Important Notes:
+- **DO NOT** run with `python app.py` (will show context warnings)
+- Use `./run_app.sh` for best AMD GPU optimization
+- App will be available at http://localhost:8502
+- Ensure you have a video file (sample_video-3.mp4) in the directory
+
+## 📹 Usage Instructions
 
 ### Threading Model
 ```
@@ -115,10 +141,8 @@ DEFECT_SEVERITY = {
 source steel_venv/bin/activate
 
 # Run the application
-python -c "from ultralytics import YOLO; model = YOLO('yolov8n.pt'); print('Model downloaded successfully')"
 ./run_app.sh
 # or
-python -c "from ultralytics import YOLO; model = YOLO('yolov8n.pt'); print('Model downloaded successfully')"
 streamlit run app.py
 ```
 
